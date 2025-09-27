@@ -35,7 +35,7 @@ class AGVEnv(gym.Env):
             charge_rate: float = 0.2,
             due_r: float = 0.10,
             due_R: float = 0.50,
-            reward_scale: float = 0.1,
+            reward_scale: float = 1.0,
             **kwargs,  #  接收额外参数
     ):
         super().__init__()
@@ -123,7 +123,7 @@ class AGVEnv(gym.Env):
         } for _ in range(self.num_agvs)]
 
         # Job 初始化（r-R 公式）
-        self.jobs = self._generate_jobs(r=self.due_r, R=self.due_R, M=6.0)
+        self.jobs = self._generate_jobs(r=self.due_r, R=self.due_R, M=4.0)
 
         # 返回观测 & 空 info
         return self._get_obs(), {}
@@ -180,20 +180,18 @@ class AGVEnv(gym.Env):
     def _count_charging(self):
         return sum(1 for agv in self.agvs if agv["status"] == 2)
 
-    # ----------------------------- 单步逻辑 -----------------------------
+    # ... 在你的 AGVEnv 类中 ...
+
     def step(self, actions):
-        """
-        actions: 长度 = num_agvs 的列表/数组，对应每台 AGV 的动作
-        """
         self.time += 1
         reward = 0.0
 
         # ---------- 规范化 actions -> list[int] ----------
         import numpy as _np
-        if isinstance(actions, (int, _np.integer)):  # 单个整数（仅当 num_agvs==1 时允许）
+        if isinstance(actions, (int, _np.integer)):
             actions = [int(actions)]
         else:
-            if hasattr(actions, "tolist"):  # tensor / ndarray
+            if hasattr(actions, "tolist"):
                 actions = actions.tolist()
             else:
                 actions = list(actions)
@@ -204,11 +202,8 @@ class AGVEnv(gym.Env):
         # ========== 1) 仅对 idle 车处理“新动作请求” ==========
         for idx, act in enumerate(actions):
             agv: AGV = self.agvs[idx]
-
-            # 非 idle（运输/充电/排队）的 AGV 本步忽略新动作
             if agv["status"] != 0:
                 continue
-
             try:
                 action = int(act)
             except Exception as e:
@@ -222,62 +217,51 @@ class AGVEnv(gym.Env):
             # ---- A) 请求充电（动作 == num_jobs）----
             if action == self.num_jobs:
                 if self._count_charging() < self.charger_capacity:
-                    agv["status"] = 2  # 直接进入充电
+                    agv["status"] = 2
                 else:
                     if idx not in self.charging_queue:
                         self.charging_queue.append(idx)
-                    agv["status"] = 3  # 排队
-                    reward -= 0.05  # 请求充电的固定成本
-                continue  # <<<< 关键：避免落入“接任务”分支
-
+                    agv["status"] = 3
             # ---- B) 请求具体任务（0..num_jobs-1）----
-            elif 0 <= action < self.num_jobs:  # <<<< 用 elif 且显式范围判断
+            elif 0 <= action < self.num_jobs:
                 job: Job = self.jobs[action]
                 if job["assigned"] == 0:
-                    agv["status"] = 1
-                    agv["task_timer"] = job["duration"]
-                    agv["current_job_id"] = action
-
-                    # 扣电并夹紧到 [0,1]
-                    agv["battery"] = max(0.0, agv["battery"] - job["duration"] / 10.0)
-
-                    job["assigned"] = 1
-                    job["assigned_to"] = idx
-
-                    # 分配奖励（全局 + 任务专属）
-                    reward += 5.0
-                    job["reward_accum"] = job.get("reward_accum", 0.0) + 5.0
+                    battery_needed = job["duration"] / 10.0
+                    if agv["battery"] < battery_needed:
+                        reward -= 5.0  # 电量耗尽惩罚
+                        continue
+                    else:
+                        agv["status"] = 1
+                        agv["task_timer"] = job["duration"]
+                        agv["current_job_id"] = action
+                        agv["battery"] = agv["battery"] - battery_needed
+                        job["assigned"] = 1
+                        job["assigned_to"] = idx
                 else:
-                    reward -= 0.1  # 任务已被占用
-
-            else:
-                # 理论到不了这里（前面有范围检查），加个保险
-                continue
+                    pass
 
         # ========== 1.5) 排队 -> 充电桩分配 ==========
         while self._count_charging() < self.charger_capacity and self.charging_queue:
             next_idx = self.charging_queue.pop(0)
             self.agvs[next_idx]["status"] = 2
 
-        # ========== 2) 动力学推进（统一） ==========
+        # ========== 2) 动力学推进与惩罚 ==========
         for agv in self.agvs:
             if agv["status"] == 1:  # 运输
                 agv["task_timer"] -= 1
             elif agv["status"] == 2:  # 充电
                 agv["battery"] = min(1.0, agv["battery"] + self.charge_rate)
+                reward -= 0.25  # 充电惩罚
                 if agv["battery"] >= 1.0:
-                    agv["status"] = 0  # 充满转 idle
+                    agv["status"] = 0
             elif agv["status"] == 3:  # 排队
-                reward -= 0.01  # 等候惩罚
+                reward -= 0.5  # 排队惩罚
 
-            # 统一夹紧电量到 [0,1]
+            # 统一夹紧电量到 [0,1]，这一步是多余的，因为电池电量永远不会低于 0
             if agv["battery"] > 1.0:
                 agv["battery"] = 1.0
-            elif agv["battery"] < 0.0:
-                agv["battery"] = 0.0
 
-
-        # ========== 3) 任务完成判定（关键：对所有运输车判断） ==========
+        # ========== 3) 任务完成判定 ==========
         for agv in self.agvs:
             if agv["status"] == 1 and agv["task_timer"] <= 0:
                 agv["status"] = 0
@@ -288,58 +272,35 @@ class AGVEnv(gym.Env):
                     job["completion_time"] = self.time
                     agv["current_job_id"] = None
 
-                    if self.time <= job["delivery_due"]:  # 准时/提前
-                        reward += 10.0
-                        job["reward_accum"] = job.get("reward_accum", 0.0) + 10.0
-                    else:  # 逾期
-                        reward -= 1.0
-                        job["reward_accum"] = job.get("reward_accum", 0.0) - 1.0
+                    # 逾期惩罚
+                    if self.time > job["delivery_due"]:
+                        overdue_steps = self.time - job["delivery_due"]
+                        penalty = overdue_steps * 2.0
+                        reward -= penalty
+                        job["reward_accum"] = job.get("reward_accum", 0.0) - penalty
+                    # 准时完成没有奖励，但不会有惩罚
+                    else:
+                        job["reward_accum"] = job.get("reward_accum", 0.0)
 
-                    # --- OLD LOGIC（保留以便回退）---
-                    # if self.time <= job["delivery_due"]:
-                    #     reward += 10.0
-                    # else:
-                    #     reward -= 0.25
+        # ========== 4) 终止条件 ==========
+        terminated = (self.completed_jobs == self.num_jobs)
+        truncated = (self.time >= self.max_steps)
 
-        # ========== 4) 小额步进惩罚 ==========
-        # 正在执行但未完成的任务（鼓励尽快完成）
-        for job in self.jobs:
-            if job["assigned"] == 1 and job["completion_time"] is None:
-                reward -= 0.001
+        # 5) info & 观测
+        raw_reward = reward
+        # 注意：最终奖励可能为负，这是正常的
+        if terminated:
+            reward += 40.0  # 移除这个奖励，让智能体专注于逾期惩罚
 
-        # 空闲惩罚（鼓励分配任务）
-        for agv in self.agvs:
-            if agv["status"] == 0:
-                reward -= 0.001
-
-        # ========== 5) 终止/截断 ==========
-        # OLD LOGIC: 更保守的逾期重罚（仅供回退参考）
-        # any_late = any(
-        #     job["assigned"] == 1 and job["completion_time"] is None and self.time > job["delivery_due"]
-        #     for job in self.jobs
-        # )
-        # if any_late:
-        #     reward -= 10.0
-
-        if self.completed_jobs == self.num_jobs:
-            reward += 100.0  # 提前完成奖励
-
-        terminated = (self.completed_jobs == self.num_jobs)  # 任务全部完成
-        truncated = (self.time >= self.max_steps)  # 步数超限
-
-        # ========== 6) info & 观测 ==========
-        raw_reward = reward                  # 保留原始奖励（未缩放）
-        reward = reward * self.reward_scale  # 统一缩放，训练用
+        reward = reward * self.reward_scale
 
         info = {
-            "raw_reward": raw_reward,        # 原始奖励，方便调试/分析
+            "raw_reward": raw_reward,
             "reward_scale": self.reward_scale
         }
 
         obs = self._get_obs()
         return obs, reward, terminated, truncated, info
-
-
     # ----------------- 新增方法 -----------------
     def summarize_assignments(self):
         rows = []
@@ -374,4 +335,6 @@ if __name__ == "__main__":
     print("tokens shape:", obs['tokens'].shape)
     print("mask shape:", obs['mask'].shape)
     print("mask shape:", obs['mask'].shape)
+
+
 
