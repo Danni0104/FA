@@ -1,8 +1,12 @@
-# scripts/train.py
-
-# 将项目根目录加入 import 路径，这样 config、model、env_agv 都能被正确导入
-from pathlib import Path
+'''# scripts/train.py
 import sys
+from pathlib import Path
+
+# 获取项目根目录的路径，根据你的项目结构，可能是 train.py 的父目录的父目录
+project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project_root))
+from model.ppo_transformer_agent import PPOAgent
+
 # __file__ 是当前脚本路径，.parent 是上一级目录
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import torch.nn.functional as F
@@ -11,7 +15,7 @@ import numpy as np
 import torch
 from config.default import config
 from env_agv.AGVEnv import AGVEnv
-from model.ppo_agent import PPOAgent
+#from model.ppo_agent import PPOAgent
 from collections import deque
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -662,6 +666,483 @@ if __name__ == "__main__":
     except Exception as e:
         import traceback
         print("  train() raised exception:", flush=True)
+        traceback.print_exc()
+
+    print(">>> scripts.train __main__ end", flush=True)
+'''
+# scripts/train.py
+
+# 将项目根目录添加到 import 路径，确保所有模块都能被正确导入
+from pathlib import Path
+import sys
+
+# __file__ 是当前脚本路径，.parent 是上一级目录
+# 这样无论从哪里运行，Python 都能找到 model、config 和 env_agv
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import torch.nn.functional as F
+from typing import List, Deque
+import numpy as np
+import torch
+from config.default import config
+from env_agv.AGVEnv import AGVEnv
+from model.ppo_transformer_agent import PPOAgent  # 确保从新模型导入
+from collections import deque
+import matplotlib.pyplot as plt
+import csv, os
+
+# ==== 全局调试开关 ====
+VERBOSE = False  # 需要详细日志时改成 True
+
+Path("logs").mkdir(parents=True, exist_ok=True)
+
+
+def _to_list_actions(a, num_agvs):
+    """
+    把 agent 返回的 a（可能是 scalar / numpy / torch / list / tuple）规范为
+    长度为 num_agvs 的 python list[int]，或抛错提示。
+    """
+    if isinstance(a, np.ndarray):
+        a_list = a.tolist()
+    elif isinstance(a, torch.Tensor):
+        a_list = a.cpu().numpy().tolist()
+    elif isinstance(a, (list, tuple)):
+        a_list = list(a)
+    elif isinstance(a, (int, np.integer)):
+        a_list = [int(a)]
+    else:
+        try:
+            a_list = list(a)
+        except Exception:
+            raise TypeError("Unsupported action type: " + str(type(a)))
+
+    if len(a_list) == 1 and num_agvs > 1:
+        a_list = [int(a_list[0])] * num_agvs
+
+    if len(a_list) != num_agvs:
+        raise ValueError(
+            f"Converted action length {len(a_list)} != num_agvs {num_agvs}. Raw action: {a}")
+
+    a_list = [int(x) for x in a_list]
+    return a_list
+
+
+def compute_gae(rewards, values, dones, gamma, lam):
+    advantages, gae = [], 0.0
+    for idx in reversed(range(len(rewards))):
+        delta = rewards[idx] + gamma * values[idx + 1] * (1 - dones[idx]) - values[idx]
+        gae = delta + gamma * lam * (1 - dones[idx]) * gae
+        advantages.insert(0, gae)
+    return advantages
+
+
+# === 统计与可视化容器（只初始化一次） ===
+ep_rewards: List[float] = []
+ma_rewards: List[float] = []
+ma_window = int(config['ppo'].get('moving_avg_window', 50))
+reward_history: Deque[float] = deque(maxlen=ma_window)
+done_all_hist: List[int] = []
+on_time_ratio_hist: List[float] = []
+
+
+def train():
+    env = AGVEnv(**config['env'])
+    obs, _ = env.reset()
+    dummy_tokens = obs['tokens']
+    feat_dim = dummy_tokens.shape[1]
+    act_dim = int(np.asarray(getattr(env.action_space, "nvec"))[0])
+    num_agvs = getattr(env, "num_agvs", None) or getattr(env, "num_agents", None)
+
+    # 构造 PPO Agent
+    agent = PPOAgent(
+        feat_dim=feat_dim,
+        T=dummy_tokens.shape[0],
+        action_dim=act_dim,
+        num_agvs=num_agvs,
+        hidden_dim=config.get('transformer', {}).get('embed_dim', 128),
+        num_heads=config.get('transformer', {}).get('num_heads', 8),
+        num_layers=config.get('transformer', {}).get('num_layers', 3),
+        lr_actor=config.get('ppo', {}).get('actor_lr', 3e-4),
+        lr_critic=config.get('ppo', {}).get('critic_lr', 1e-3),
+    )
+
+    # 确认 agent 有关键属性
+    print("DEBUG: PPOAgent type:", type(agent), "module:",
+          getattr(agent, "__module__", "<unknown>"))
+    print("DEBUG: agent has attributes:",
+          [n for n in ["num_agvs", "device", "optimizer_actor", "optimizer_critic"] if
+           hasattr(agent, n)])
+
+    # 3) 主训练循环
+    for ep in range(config['ppo']['n_episodes']):
+        obs, _ = env.reset()
+        tokens = obs['tokens']
+        mask = obs['mask']
+
+        obs_buf, act_buf, logp_buf = [], [], []
+        rew_buf, val_buf, done_buf = [], [], []
+        action_mask_buf = []
+        agent_active_buf = []
+
+        done = False
+        a = None
+
+        while not done and len(obs_buf) < config['ppo']['n_steps']:
+            num_jobs = env.num_jobs
+            action_dim = num_jobs + 1
+            job_free = obs["job_mask"].astype(bool)
+            am_step = np.zeros((env.num_agvs, action_dim), dtype=bool)
+
+            job_tokens = obs["tokens"][env.num_agvs: env.num_agvs + num_jobs]
+            slack = job_tokens[:, 3]
+            urgent_exists = bool((slack < 0.0).any())
+
+            for i, agv in enumerate(env.agvs):
+                if agv["status"] == 0:
+                    am_step[i, :num_jobs] = job_free
+                    if urgent_exists and agv["battery"] > 0.6:
+                        am_step[i, num_jobs] = False
+                    else:
+                        am_step[i, num_jobs] = (agv["battery"] < 0.999)
+                else:
+                    am_step[i, num_jobs] = True
+
+            rows_none = ~am_step.any(axis=1)
+            am_step[rows_none, num_jobs] = True
+
+            agent_active = np.array([agv["status"] == 0 for agv in env.agvs], dtype=bool)
+
+            a, logp, _ = agent.choose_action(tokens, mask, action_mask=am_step)
+
+            action_mask_buf.append(am_step)
+            agent_active_buf.append(agent_active)
+
+            if isinstance(logp, torch.Tensor):
+                logp_cpu = logp.detach().cpu()
+            else:
+                logp_cpu = torch.tensor(float(logp), dtype=torch.float32)
+
+            v = agent.get_value(tokens, mask)
+            val_buf.append(float(v))
+            a_to_env = _to_list_actions(a, env.num_agvs)
+            obs2, r, term, trunc, info = env.step(a_to_env)
+            next_tokens = obs2['tokens']
+            next_mask = obs2['mask']
+            obs = obs2
+
+            if isinstance(r, np.ndarray):
+                r_print = r.tolist()
+            else:
+                r_print = r
+
+            per_agent_from_info = None
+            if isinstance(info, dict):
+                for key in (
+                        'per_agent_reward', 'rewards', 'reward_per_agent', 'agent_rewards',
+                        'rewards_list'):
+                    if key in info:
+                        per_agent_from_info = info[key]
+                        break
+
+            if isinstance(r_print, (list, tuple, np.ndarray)):
+                per_agent_rewards = [float(x) for x in (
+                    list(r_print) if not isinstance(r_print, np.ndarray) else r_print.tolist())]
+            elif per_agent_from_info is not None:
+                try:
+                    if isinstance(per_agent_from_info, np.ndarray):
+                        per_agent_rewards = per_agent_from_info.astype(np.float64).tolist()
+                    elif isinstance(per_agent_from_info, (list, tuple)):
+                        per_agent_rewards = [float(x) for x in per_agent_from_info]
+                    elif isinstance(per_agent_from_info, dict):
+                        per_agent_rewards = [float(x) for x in per_agent_from_info.values()]
+                    else:
+                        per_agent_rewards = [float(per_agent_from_info)] * env.num_agvs
+                except (TypeError, ValueError):
+                    per_agent_rewards = [0.0] * env.num_agvs
+            else:
+                try:
+                    scalar = float(r_print)
+                except (TypeError, ValueError):
+                    scalar = 0.0
+                    print("WARN: cannot parse scalar reward r; using 0.0. r:", r_print, " info:",
+                          info)
+                per_agent_rewards = [scalar] * env.num_agvs
+
+            try:
+                per_agent_arr = np.array(per_agent_rewards, dtype=np.float64)
+            except Exception:
+                per_agent_arr = np.zeros(env.num_agvs, dtype=np.float64)
+
+            if (not isinstance(r_print, (list, tuple, np.ndarray))) and (
+                    per_agent_from_info is None):
+                try:
+                    step_total = float(r_print)
+                except Exception:
+                    step_total = float(np.sum(per_agent_arr))
+            else:
+                step_total = float(np.sum(per_agent_arr))
+
+            step_idx = len(obs_buf)
+            if step_idx % 50 == 0 or step_idx == 0 or done:
+                print(f"STEP {step_idx:03d} actions -> {a_to_env}")
+                print(f"  step_total used for training: {step_total}")
+
+            obs_buf.append(tokens)
+            act_buf.append(a_to_env)
+            logp_buf.append(logp_cpu)
+            rew_buf.append(step_total)
+            done_buf.append(term or trunc)
+            tokens, mask = next_tokens, next_mask
+            done = term or trunc
+
+        v_last = agent.get_value(tokens, mask)
+        if isinstance(v_last, torch.Tensor):
+            v_last = float(v_last.detach().cpu())
+        else:
+            v_last = float(v_last)
+        val_buf.append(v_last)
+
+        advs = compute_gae(rew_buf, val_buf, done_buf, config['ppo']['gamma'],
+                           config['ppo']['gae_lambda'])
+        returns = [a + v for a, v in zip(advs, val_buf[:-1])]
+        states_np = np.stack(
+            [t if isinstance(t, np.ndarray) else t.detach().cpu().numpy() for t in obs_buf], axis=0)
+        states = torch.from_numpy(states_np).float().to(agent.device)
+        actions_np = np.array(act_buf, dtype=np.int64)
+        actions = torch.from_numpy(actions_np).to(agent.device)
+        oldlogp = torch.stack(logp_buf).to(agent.device)
+        if oldlogp.dim() > 1:
+            oldlogp = oldlogp.squeeze(-1)
+        rets_np = np.array(returns, dtype=np.float32)
+        rets = torch.from_numpy(rets_np).to(agent.device)
+        advs_np = np.array(advs, dtype=np.float32)
+        advs_t = torch.from_numpy(advs_np).to(agent.device)
+
+        states = states.detach()
+        actions = actions.detach()
+        oldlogp = oldlogp.detach()
+        rets = rets.detach()
+        advs_t = advs_t.detach()
+
+        if len(action_mask_buf) > 0:
+            am_np = np.stack(action_mask_buf, axis=0).astype(np.bool_)
+            am_t = torch.from_numpy(am_np).to(agent.device)
+            if not torch.all(am_t.any(dim=-1)):
+                raise ValueError("action_mask has a row with no valid action.")
+        else:
+            am_t = None
+
+        if len(agent_active_buf) > 0:
+            active_np = np.stack(agent_active_buf, axis=0).astype(np.bool_)
+            active_t = torch.from_numpy(active_np).to(agent.device)
+        else:
+            active_t = None
+
+        for _ in range(config['ppo']['n_epochs']):
+            try:
+                # 确保这里传递了 action_mask 参数
+                logp_new, entropy, value = agent.evaluate(states, actions, mask=None,
+                                                          action_mask=am_t)
+            except Exception:
+                import traceback as _tb
+                print("ERROR: agent.evaluate raised an exception. Traceback follows:", flush=True)
+                _tb.print_exc()
+                print("  states.shape:", getattr(states, "shape", None), "dtype:",
+                      getattr(states, "dtype", None), flush=True)
+                print("  actions.shape:", getattr(actions, "shape", None), "dtype:",
+                      getattr(actions, "dtype", None), flush=True)
+                print("  oldlogp.shape:", getattr(oldlogp, "shape", None), "dtype:",
+                      getattr(oldlogp, "dtype", None), flush=True)
+                raise
+
+            N = states.shape[0]
+            device = agent.device
+            logp_new = torch.as_tensor(logp_new, device=device)
+            entropy = torch.as_tensor(entropy, device=device)
+            value = torch.as_tensor(value, device=device)
+            oldlogp = torch.as_tensor(oldlogp, device=device)
+
+            if logp_new.dim() == 2:
+                if 'active_t' in locals() and active_t is not None:
+                    act_f = active_t.to(logp_new.device).float()
+                    logp_new = (logp_new * act_f).sum(dim=1)
+                    entropy = (entropy * act_f).sum(dim=1) / act_f.sum(dim=1).clamp_min(1)
+                else:
+                    logp_new = logp_new.sum(dim=1)
+                    entropy = entropy.mean(dim=1)
+
+            if value.dim() > 1:
+                value = value.squeeze(-1)
+
+            if oldlogp.dim() > 1:
+                oldlogp = oldlogp.squeeze(-1)
+
+            logp_new = logp_new.to(torch.float32)
+            entropy = entropy.to(torch.float32)
+            value = value.to(torch.float32)
+            oldlogp = oldlogp.to(torch.float32)
+
+            def reduce_if_per_agent(t, name):
+                if t.dim() == 2:
+                    if t.size(1) == getattr(agent, "num_agvs", None):
+                        return t.sum(dim=1)
+                    if t.size(1) == 1:
+                        return t.squeeze(1)
+                    raise ValueError(
+                        f"{name} has unexpected 2-D shape {t.shape}; expected [N,num_agvs] or [N,1].")
+                return t
+
+            logp_new = reduce_if_per_agent(logp_new, "logp_new")
+            entropy = reduce_if_per_agent(entropy, "entropy")
+
+            def ensure_1d(t, name):
+                if t.dim() == 0:
+                    if N == 1:
+                        return t.unsqueeze(0)
+                    raise ValueError(f"{name} is 0-d but batch N={N} > 1.")
+                if t.dim() == 2 and t.size(1) == 1:
+                    return t.squeeze(1)
+                if t.dim() != 1:
+                    raise ValueError(f"{name} has unexpected shape {t.shape}; expected [N].")
+                return t
+
+            logp_new = ensure_1d(logp_new, "logp_new")
+            entropy = ensure_1d(entropy, "entropy")
+            value = ensure_1d(value, "value")
+
+            if oldlogp.shape != logp_new.shape:
+                raise ValueError(
+                    f"Shape mismatch after normalization: oldlogp.shape={oldlogp.shape} vs logp_new.shape={logp_new.shape}. "
+                    "If your agent returns per-AGV logprobs, ensure both choose_action and evaluate use the same aggregation (sum/mean).")
+
+            ratio = torch.exp(logp_new - oldlogp)
+            advs_norm = (advs_t - advs_t.mean()) / (advs_t.std() + 1e-8)
+            clip_eps = config['ppo']['clip_range']
+            unclipped = ratio * advs_norm
+            clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advs_norm
+            loss_pi = -torch.min(unclipped, clipped).mean()
+            loss_v = config['ppo']['vf_coef'] * F.mse_loss(value, rets)
+            loss_ent = -config['ppo']['ent_coef'] * entropy.mean()
+            loss = loss_pi + loss_v + loss_ent
+
+            print(
+                f"[PPO] loss {loss.item():.6f} pi {loss_pi.item():.6f} v {loss_v.item():.6f} ent {loss_ent.item():.6f}"
+            )
+
+            agent.optimizer_actor.zero_grad()
+            agent.optimizer_critic.zero_grad()
+            loss.backward()
+            agent.optimizer_actor.step()
+            agent.optimizer_critic.step()
+
+        total_reward = float(sum(rew_buf))
+        ep_rewards.append(total_reward)
+        reward_history.append(total_reward)
+        ma = float(np.mean(reward_history))
+        ma_rewards.append(ma)
+
+        print(f"len(ep_rewards)={len(ep_rewards)} "
+              f"len(ma_rewards)={len(ma_rewards)} "
+              f"head={ep_rewards[:3]} tail={ep_rewards[-3:]}")
+
+        summary = env.summarize_assignments()
+        done_all = int(env.completed_jobs == env.num_jobs)
+        on_time = sum(1 for r in summary if (r["completion_time"] is not None and r["on_time"]))
+        finished = sum(1 for r in summary if r["completion_time"] is not None)
+        on_time_ratio = (on_time / finished) if finished > 0 else 0.0
+        done_all_hist.append(done_all)
+        on_time_ratio_hist.append(on_time_ratio)
+
+        csv_path = "logs/jobs_per_episode.csv"
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "episode", "job_id", "assigned_to", "assigned",
+                "duration", "delivery_due", "completion_time", "on_time", "job_reward"
+            ])
+            if not file_exists:
+                writer.writeheader()
+            for r in summary:
+                writer.writerow({
+                    "episode": ep,
+                    "job_id": r["job_id"],
+                    "assigned_to": r["assigned_to"],
+                    "assigned": r["assigned"],
+                    "duration": r["duration"],
+                    "delivery_due": r["delivery_due"],
+                    "completion_time": r["completion_time"],
+                    "on_time": int(bool(r["on_time"])),
+                    "job_reward": r["job_reward"],
+                })
+
+        Path("logs").mkdir(parents=True, exist_ok=True)
+        np.savetxt(
+            "logs/episode_rewards.csv",
+            np.c_[
+                np.arange(len(ep_rewards)), np.array(ep_rewards, dtype=float), np.array(ma_rewards,
+                                                                                        dtype=float)],
+            delimiter=",",
+            header="episode,reward,ma",
+            comments=""
+        )
+
+        if ep % 10 == 0:
+            print(
+                f"Episode {ep:4d}  Reward {total_reward:.2f}  |  moving_avg({ma_window})={ma:.3f}")
+            last_step_reward = rew_buf[-1] if len(rew_buf) > 0 else None
+            if a is not None:
+                try:
+                    import numpy as _np, torch as _th
+                    if isinstance(a, _th.Tensor):
+                        a_repr = a.cpu().numpy().tolist()
+                    elif isinstance(a, _np.ndarray):
+                        a_repr = a.tolist()
+                    else:
+                        a_repr = a
+                except Exception as e:
+                    pass
+
+        if ep % 100 == 0:
+            Path("logs").mkdir(parents=True, exist_ok=True)
+            agent.save("checkpoints/ppo_agv.pt")
+
+        if (ep + 1) % 100 == 0:
+            fig = plt.figure()
+            x = np.arange(len(ep_rewards))
+            if len(ep_rewards) >= 2:
+                plt.plot(x, ep_rewards, label="episode reward")
+                plt.plot(x, ma_rewards, label=f"moving avg ({ma_window})")
+            else:
+                plt.plot([0], [ep_rewards[0]], marker="o", label="episode reward")
+                plt.plot([0], [ma_rewards[0]], marker="o", label=f"moving avg ({ma_window})")
+
+            plt.xlabel("episode")
+            plt.ylabel("reward")
+            plt.title("PPO Training Rewards")
+            plt.legend()
+            ys = list(ep_rewards) + list(ma_rewards)
+            if ys:
+                ymin, ymax = float(min(ys)), float(max(ys))
+                if ymin == ymax:
+                    ymin -= 1.0
+                    ymax += 1.0
+                plt.ylim(ymin, ymax)
+            plt.tight_layout()
+            plt.show()
+
+
+if __name__ == "__main__":
+    print(">>> scripts.train __main__ start", flush=True)
+    try:
+        from config.default import config
+    except Exception as e:
+        pass
+    try:
+        train()
+    except Exception as e:
+        import traceback
+
         traceback.print_exc()
 
     print(">>> scripts.train __main__ end", flush=True)
